@@ -171,6 +171,8 @@ for v in form.vertices():
     J += math.sqrt(Rx*Rx + Ry*Ry)
 
 print("Objective J (sum horizontal reactions):", J)
+print("supports:", sum(1 for v in form.vertices() if form.vertex_attribute(v, "is_support")))
+print("bbox:", form.bounding_box())
 
 
 # -----------------------------
