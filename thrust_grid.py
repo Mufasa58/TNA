@@ -1,268 +1,202 @@
-# -*- coding: utf-8 -*-
-# Rhino 8 + Python 3.9
-# Pure COMPAS-TNA funicular test (no RhinoVAULT)
+#! python3
+# venv: rvdev
 
+import math
 import Rhino
 import scriptcontext as sc
 import System
-import System.Drawing as SD
+from System.Drawing import Color
 
-from compas_tna.diagrams import FormDiagram, ForceDiagram
+from compas_tna.diagrams import FormDiagram
 from compas_tna.equilibrium import vertical_from_zmax
 
 
 # -----------------------------
-# PARAMETERS
+# PARAMETERS (edit these)
 # -----------------------------
-nx, ny = 12, 12          # Number of cells
-dx, dy = 7.0, 7.0        # Cell size (total span = nx*dx, ny*dy)
-zmax = 3.0               # Maximum sag/rise of funicular
-thickness = 0.3          # Slab thickness for envelope
+BAY = 7.0
+NBAYS = 3
+L = BAY * NBAYS            # 21m
+NX = 24                    # mesh resolution in x (increase for smoother)
+NY = 24                    # mesh resolution in y
+ZMAX = 3.0                 # target rise (m) -> bigger = “deeper” funicular
+DENSITY = 1.0              # load density proxy (relative)
+KMAX = 200
+XTOL = 0.01
+RTOL = 0.001
 
-# Support configuration: 
-# 'x_sides' = support at x=min and x=max (barrel vault spanning X)
-# 'y_sides' = support at y=min and y=max (barrel vault spanning Y)
-# 'all_sides' = support all four edges
-# Or use a list like ['x_min', 'x_max', 'y_min', 'y_max'] for custom
-support_config = 'x_sides'
-
-# Non-uniform loads (optional): dict of vertex_key -> load_multiplier
-# Leave empty {} for uniform loading
-custom_loads = {}  # e.g., {50: 2.0, 51: 2.0} to double load at vertices 50, 51
+DRAW_LAYER = "TNA::Form"
+REACTION_LAYER = "TNA::Reactions"
 
 
 # -----------------------------
-# 1) Build a plan topology
+# RHINO helpers
 # -----------------------------
-form = FormDiagram.from_meshgrid(dx=dx, dy=dy, nx=nx, ny=ny)
+def ensure_layer(name, color):
+    idx = sc.doc.Layers.FindByFullPath(name, True)
+    if idx >= 0:
+        return idx
+    layer = Rhino.DocObjects.Layer()
+    layer.Name = name
+    layer.Color = color
+    return sc.doc.Layers.Add(layer)
+
+def draw_lines(lines, layer_name, color):
+    layer_idx = ensure_layer(layer_name, color)
+    attr = Rhino.DocObjects.ObjectAttributes()
+    attr.LayerIndex = layer_idx
+    ids = []
+    for a, b in lines:
+        ids.append(sc.doc.Objects.AddLine(a, b, attr))
+    return ids
+
+def draw_arrows(arrows, layer_name, color):
+    layer_idx = ensure_layer(layer_name, color)
+    attr = Rhino.DocObjects.ObjectAttributes()
+    attr.LayerIndex = layer_idx
+    ids = []
+    for a, b in arrows:
+        ids.append(sc.doc.Objects.AddLine(a, b, attr))
+    return ids
+
 
 # -----------------------------
-# 2) Supports (boundary)
+# 1) Build form diagram mesh
 # -----------------------------
-# Two parallel sides: x=0 and x=max (like a barrel vault spanning in X)
-# Note: from_meshgrid creates a grid from (0,0) to (dx, dy), NOT (0,0) to (dx*nx, dy*ny)
+# Meshgrid uses dx, dy, nx, ny as step sizes + counts; easiest is:
+dx = L / NX
+dy = L / NY
 
-# First, find the actual bounding box of the form diagram
-all_x = [form.vertex_coordinates(v)[0] for v in form.vertices()]
-all_y = [form.vertex_coordinates(v)[1] for v in form.vertices()]
-min_x, max_x = min(all_x), max(all_x)
-min_y, max_y = min(all_y), max(all_y)
+form = FormDiagram.from_meshgrid(dx=dx, nx=NX, dy=dy, ny=NY)
 
-print(f"Form diagram bounds: X=[{min_x:.2f}, {max_x:.2f}], Y=[{min_y:.2f}, {max_y:.2f}]")
+# Move to world coords so it spans [0..L] in x and y
+# (meshgrid already starts at origin, so nothing else needed)
 
+
+# -----------------------------
+# 2) Define supports (4x4 columns)
+# -----------------------------
+col_coords = set()
+for i in range(NBAYS + 1):
+    for j in range(NBAYS + 1):
+        col_coords.add((round(i * BAY, 6), round(j * BAY, 6)))
+
+support_count = 0
 for v in form.vertices():
     x, y, z = form.vertex_coordinates(v)
-    
-    # Check each boundary condition
-    on_x_min = abs(x - min_x) < 1e-9
-    on_x_max = abs(x - max_x) < 1e-9
-    on_y_min = abs(y - min_y) < 1e-9
-    on_y_max = abs(y - max_y) < 1e-9
-    
-    if support_config == 'x_sides':
-        # Support at x=min and x=max (barrel vault spanning in X direction)
-        is_support = on_x_min or on_x_max
-    elif support_config == 'y_sides':
-        # Support at y=min and y=max (barrel vault spanning in Y direction)
-        is_support = on_y_min or on_y_max
-    elif support_config == 'all_sides':
-        # All four sides supported
-        is_support = on_x_min or on_x_max or on_y_min or on_y_max
-    elif isinstance(support_config, list):
-        # Custom: list of sides, e.g., ['x_min', 'x_max', 'y_min']
-        is_support = False
-        if 'x_min' in support_config: is_support = is_support or on_x_min
-        if 'x_max' in support_config: is_support = is_support or on_x_max
-        if 'y_min' in support_config: is_support = is_support or on_y_min
-        if 'y_max' in support_config: is_support = is_support or on_y_max
-    else:
-        is_support = False
-    
-    form.vertex_attribute(v, "is_support", is_support)
+    key = (round(x, 6), round(y, 6))
+    if key in col_coords:
+        form.vertex_attribute(v, "is_support", True)
+        support_count += 1
 
-# Use actual dimensions for later reference
-total_x = max_x - min_x
-total_y = max_y - min_y
+print("Supports set:", support_count, "(expected 16)")
 
 # -----------------------------
-# 3) Apply loads (uniform by default)
+# 3) Solve funicular form (vertical)
 # -----------------------------
-# Default load is 1.0 per vertex area; modify with custom_loads
+# This computes a funicular shape under uniform density with target rise ZMAX
+form, scale = vertical_from_zmax(
+    form=form,
+    zmax=ZMAX,
+    kmax=KMAX,
+    xtol=XTOL,
+    rtol=RTOL,
+    density=DENSITY,
+    display=False
+)
+
+print("Solved. scale:", scale)
+
+
+# -----------------------------
+# 4) Compute support reactions (proxy) + objective
+# -----------------------------
+# COMPAS-TNA stores loads implicitly; a simple robust proxy is:
+# reaction = -sum(edge forces * unit vectors) for edges incident at support
+# We'll compute from force densities if available; otherwise use geometry-only proxy.
+#
+# In vertical_from_zmax results, edges usually have 'q' force density.
+# Force in edge ~ q * length. Direction is along edge.
+
+def vec(p, q):
+    return (q.X - p.X, q.Y - p.Y, q.Z - p.Z)
+
+def length(v):
+    return math.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
+
+def unit(v):
+    l = length(v)
+    if l < 1e-12:
+        return (0.0, 0.0, 0.0)
+    return (v[0]/l, v[1]/l, v[2]/l)
+
+reactions = {}
+J = 0.0
+
 for v in form.vertices():
-    load = 1.0
-    if v in custom_loads:
-        load = custom_loads[v]
-    form.vertex_attribute(v, "pz", load)
+    if not form.vertex_attribute(v, "is_support"):
+        continue
+
+    px, py, pz = form.vertex_coordinates(v)
+    P = Rhino.Geometry.Point3d(px, py, pz)
+
+    Rx = Ry = Rz = 0.0
+
+    for nbr in form.vertex_neighbors(v):
+        q = form.edge_attribute((v, nbr), "q")
+        if q is None:
+            q = form.edge_attribute((nbr, v), "q")
+        if q is None:
+            q = 0.0
+
+        nx, ny, nz = form.vertex_coordinates(nbr)
+        Q = Rhino.Geometry.Point3d(nx, ny, nz)
+
+        d = vec(P, Q)
+        Lij = length(d)
+        u = unit(d)
+
+        # axial force magnitude proxy
+        N = q * Lij
+
+        # contribution to node equilibrium
+        Rx += N * u[0]
+        Ry += N * u[1]
+        Rz += N * u[2]
+
+    # Reaction is opposite of internal edge resultants
+    Rx, Ry, Rz = -Rx, -Ry, -Rz
+
+    reactions[v] = (Rx, Ry, Rz)
+    J += math.sqrt(Rx*Rx + Ry*Ry)
+
+print("Objective J (sum horizontal reactions):", J)
+
 
 # -----------------------------
-# 4) Vertical equilibrium (funicular)
+# 5) Draw in Rhino
 # -----------------------------
-# vertical_from_zmax handles the equilibrium computation internally
-form_eq, scale = vertical_from_zmax(form, zmax=zmax, kmax=200, xtol=0.001, rtol=1e-6, density=1.0, display=False)
+# draw form edges
+lines = []
+for u, v in form.edges():
+    ax, ay, az = form.vertex_coordinates(u)
+    bx, by, bz = form.vertex_coordinates(v)
+    A = Rhino.Geometry.Point3d(ax, ay, az)
+    B = Rhino.Geometry.Point3d(bx, by, bz)
+    lines.append((A, B))
 
-# -----------------------------
-# 5) Create Force Diagram (after equilibrium)
-# -----------------------------
-# Create force diagram from the equilibrated form
-force = ForceDiagram.from_formdiagram(form_eq)
+draw_lines(lines, DRAW_LAYER, Color.White)
 
-# -----------------------------
-# 6) Compute envelope (intrados/extrados)
-# -----------------------------
-# Store envelope z-values as vertex attributes
-half_t = thickness / 2.0
-for v in form_eq.vertices():
-    x, y, z = form_eq.vertex_coordinates(v)
-    form_eq.vertex_attribute(v, "z_intrados", z - half_t)
-    form_eq.vertex_attribute(v, "z_extrados", z + half_t)
+# draw reaction arrows at supports (scaled)
+arrows = []
+arrow_scale = 0.15  # tweak
+for v, (Rx, Ry, Rz) in reactions.items():
+    x, y, z = form.vertex_coordinates(v)
+    A = Rhino.Geometry.Point3d(x, y, z)
+    B = Rhino.Geometry.Point3d(x + Rx * arrow_scale, y + Ry * arrow_scale, z + Rz * arrow_scale)
+    arrows.append((A, B))
 
-# -----------------------------
-# RHINO DRAWING HELPERS
-# -----------------------------
-doc = sc.doc
+draw_arrows(arrows, REACTION_LAYER, Color.Cyan)
 
-def ensure_layer(name, color):
-    """Create layer if it doesn't exist, return layer index."""
-    idx = doc.Layers.FindByFullPath(name, True)
-    if idx < 0:
-        idx = doc.Layers.Add(name, color)
-    return idx
-
-def add_curve_to_layer(pt0, pt1, layer_idx):
-    """Add a line/curve between two points on specified layer."""
-    line = Rhino.Geometry.Line(pt0, pt1)
-    obj_id = doc.Objects.AddLine(line)
-    if obj_id != System.Guid.Empty:
-        obj = doc.Objects.FindId(obj_id)
-        if obj:
-            obj.Attributes.LayerIndex = layer_idx
-            obj.CommitChanges()
-
-def add_point_to_layer(pt, layer_idx):
-    """Add a point on specified layer."""
-    obj_id = doc.Objects.AddPoint(pt)
-    if obj_id != System.Guid.Empty:
-        obj = doc.Objects.FindId(obj_id)
-        if obj:
-            obj.Attributes.LayerIndex = layer_idx
-            obj.CommitChanges()
-
-def add_mesh_to_layer(vertices, faces, layer_idx):
-    """Create a Rhino mesh from vertices and faces."""
-    mesh = Rhino.Geometry.Mesh()
-    for v in vertices:
-        mesh.Vertices.Add(v[0], v[1], v[2])
-    for f in faces:
-        if len(f) == 3:
-            mesh.Faces.AddFace(f[0], f[1], f[2])
-        elif len(f) == 4:
-            mesh.Faces.AddFace(f[0], f[1], f[2], f[3])
-    mesh.Normals.ComputeNormals()
-    mesh.Compact()
-    obj_id = doc.Objects.AddMesh(mesh)
-    if obj_id != System.Guid.Empty:
-        obj = doc.Objects.FindId(obj_id)
-        if obj:
-            obj.Attributes.LayerIndex = layer_idx
-            obj.CommitChanges()
-
-# -----------------------------
-# 7) Draw Form Diagram (thrust network)
-# -----------------------------
-layer_form = ensure_layer("TNA::Form", SD.Color.Blue)
-layer_supports = ensure_layer("TNA::Supports", SD.Color.Red)
-
-for u, v in form_eq.edges():
-    x1, y1, z1 = form_eq.vertex_coordinates(u)
-    x2, y2, z2 = form_eq.vertex_coordinates(v)
-    p1 = Rhino.Geometry.Point3d(x1, y1, z1)
-    p2 = Rhino.Geometry.Point3d(x2, y2, z2)
-    add_curve_to_layer(p1, p2, layer_form)
-
-# Draw support points
-for v in form_eq.vertices():
-    if form_eq.vertex_attribute(v, "is_support"):
-        x, y, z = form_eq.vertex_coordinates(v)
-        add_point_to_layer(Rhino.Geometry.Point3d(x, y, z), layer_supports)
-
-# -----------------------------
-# 8) Draw Force Diagram (offset to the side)
-# -----------------------------
-layer_force = ensure_layer("TNA::Force", SD.Color.Green)
-
-# Offset force diagram to the right of the form
-force_offset_x = total_x + 20.0
-force_offset_y = 0.0
-
-for u, v in force.edges():
-    x1, y1, z1 = force.vertex_coordinates(u)
-    x2, y2, z2 = force.vertex_coordinates(v)
-    p1 = Rhino.Geometry.Point3d(x1 + force_offset_x, y1 + force_offset_y, 0)
-    p2 = Rhino.Geometry.Point3d(x2 + force_offset_x, y2 + force_offset_y, 0)
-    add_curve_to_layer(p1, p2, layer_force)
-
-# -----------------------------
-# 9) Draw Envelope (intrados & extrados meshes)
-# -----------------------------
-layer_intrados = ensure_layer("TNA::Intrados", SD.Color.Orange)
-layer_extrados = ensure_layer("TNA::Extrados", SD.Color.Purple)
-layer_thrust = ensure_layer("TNA::ThrustMesh", SD.Color.Cyan)
-
-# Build vertex index mapping
-vertex_keys = list(form_eq.vertices())
-key_to_index = {key: i for i, key in enumerate(vertex_keys)}
-
-# Get faces from form diagram
-faces = []
-for fkey in form_eq.faces():
-    face_verts = form_eq.face_vertices(fkey)
-    if face_verts:
-        faces.append([key_to_index[v] for v in face_verts])
-
-# Thrust surface (middle)
-verts_thrust = []
-for v in vertex_keys:
-    x, y, z = form_eq.vertex_coordinates(v)
-    verts_thrust.append((x, y, z))
-add_mesh_to_layer(verts_thrust, faces, layer_thrust)
-
-# Intrados (bottom of slab)
-verts_intrados = []
-for v in vertex_keys:
-    x, y, _ = form_eq.vertex_coordinates(v)
-    z_int = form_eq.vertex_attribute(v, "z_intrados")
-    verts_intrados.append((x, y, z_int))
-add_mesh_to_layer(verts_intrados, faces, layer_intrados)
-
-# Extrados (top of slab)
-verts_extrados = []
-for v in vertex_keys:
-    x, y, _ = form_eq.vertex_coordinates(v)
-    z_ext = form_eq.vertex_attribute(v, "z_extrados")
-    verts_extrados.append((x, y, z_ext))
-add_mesh_to_layer(verts_extrados, faces, layer_extrados)
-
-# -----------------------------
-# 10) Refresh and report
-# -----------------------------
-doc.Views.Redraw()
-
-print("=" * 50)
-print("TNA Analysis Complete")
-print("=" * 50)
-print(f"Grid: {nx} x {ny} cells")
-print(f"Span: {total_x:.1f} x {total_y:.1f} units")
-print(f"Support config: {support_config}")
-print(f"zmax: {zmax} | scale: {scale:.4f}")
-print(f"Slab thickness: {thickness}")
-print(f"Vertices: {form_eq.number_of_vertices()} | Edges: {form_eq.number_of_edges()}")
-print("=" * 50)
-print("Layers created:")
-print("  - TNA::Form (blue) - Thrust network edges")
-print("  - TNA::Supports (red) - Support points")
-print("  - TNA::Force (green) - Force diagram")
-print("  - TNA::ThrustMesh (cyan) - Middle surface mesh")
-print("  - TNA::Intrados (orange) - Bottom of slab")
-print("  - TNA::Extrados (purple) - Top of slab")
-print("=" * 50)
-
+sc.doc.Views.Redraw()
+print("Done.")
