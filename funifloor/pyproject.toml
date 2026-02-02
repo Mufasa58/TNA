@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "funifloor"
+version = "0.1.0"
+description = "Funicular prefabricated floor: TNA + segmentation + FE verification"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Funicular Floor Team"}
+]
+
+dependencies = [
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "compas>=2.0",
+    "compas_tna>=0.7",
+    "meshio>=5.0",
+    "pyvista>=0.40",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "mypy"]
+
+[project.scripts]
+funifloor = "funifloor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

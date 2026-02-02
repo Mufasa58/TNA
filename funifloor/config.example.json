@@ -1,0 +1,42 @@
+{
+    "geometry": {
+        "span_x": 5.0,
+        "span_y": 5.0,
+        "n_bays_x": 3,
+        "n_bays_y": 3,
+        "rise_min": 0.3,
+        "rise_max": 0.6,
+        "rise_target": 0.5
+    },
+    "structure": {
+        "thickness": 0.08,
+        "material": {
+            "E": 30000.0,
+            "nu": 0.2,
+            "density": 2500.0
+        }
+    },
+    "loads": {
+        "self_weight": true,
+        "additional_dead": 1.0,
+        "live": 2.5,
+        "load_factor": 1.35
+    },
+    "segmentation": {
+        "strategy": "S1",
+        "n_panels_x": 3,
+        "n_panels_y": 3,
+        "max_panel_weight": 2500.0,
+        "max_panel_dimension": 3.0
+    },
+    "solver": {
+        "use_calculix": true,
+        "fallback_if_missing": true,
+        "ccx_path": null
+    },
+    "output": {
+        "dir": "./out",
+        "formats": ["obj", "vtk", "json", "csv"],
+        "include_paraview_script": false
+    }
+}

@@ -60,17 +60,22 @@ PARAMS: Dict[str, float] = {
     "layer_force": "TNA_FORCE",
     "layer_seams": "TNA_SEAMS",
     "draw_vertices": False,     # points are very heavy at high resolution
+    "draw_form_as_mesh": True,  # draw form as single Rhino mesh (fast + clean)
+    "draw_form_edges": False,   # turn off edge-line drawing
+    "draw_force_edges": False,  # force diagram off for now
     "draw_every_nth_edge": 20,  # decimation for form edges drawing (1=draw all)
     "draw_every_nth_colored_edge": 25,  # decimation for colored edges (1=draw all)
     "draw_colored_forces": False,       # keep False initially at high resolution
     "draw_every_nth_force_edge": 20,
-
 
     "draw_scale_force": 1.0,
     "force_offset_x": 24.0,
     "force_offset_y": 0.0,
 
     # Seams / segmentation
+    "draw_seams": True,
+    "seam_draw_on_surface": True,
+    "seam_sample_step": 2,       # sample every N grid points along seam polyline
     "oblique_offset_deg": 45.0,  # rotate seams away from local force direction
     "seam_draw_z": 0.02,         # plan seam draw height (small)
     "inner_radius_frac": 0.22,   # center piece size relative to bay
@@ -80,6 +85,34 @@ PARAMS: Dict[str, float] = {
 # ==============================================================================
 # Rhino helpers
 # ==============================================================================
+
+def units_per_meter() -> float:
+    """
+    Return the conversion factor from meters to current Rhino document units.
+    E.g., if doc is in mm, returns 1000.0; if in meters, returns 1.0.
+    """
+    unit_system = sc.doc.ModelUnitSystem
+    
+    # Rhino.UnitSystem enum values
+    if unit_system == Rhino.UnitSystem.Millimeters:
+        return 1000.0
+    elif unit_system == Rhino.UnitSystem.Centimeters:
+        return 100.0
+    elif unit_system == Rhino.UnitSystem.Meters:
+        return 1.0
+    elif unit_system == Rhino.UnitSystem.Inches:
+        return 39.3701
+    elif unit_system == Rhino.UnitSystem.Feet:
+        return 3.28084
+    elif unit_system == Rhino.UnitSystem.Yards:
+        return 1.09361
+    elif unit_system == Rhino.UnitSystem.Kilometers:
+        return 0.001
+    else:
+        # Default to meters if unknown
+        print(f"[TNA] WARNING: Unknown unit system {unit_system}, assuming meters")
+        return 1.0
+
 
 def _ensure_layer(name: str) -> int:
     """Create layer if missing. Return layer index."""
@@ -141,6 +174,85 @@ def clear_layer_objects(layer_name: str) -> None:
     ids = [obj.Id for obj in doc.Objects if obj.Attributes.LayerIndex == layer_index]
     for gid in ids:
         doc.Objects.Delete(gid, True)
+
+
+def _add_rhino_mesh(mesh: Rhino.Geometry.Mesh, layer: str, color=None) -> None:
+    """Add a Rhino mesh to the document on the specified layer."""
+    doc = sc.doc
+    idx = _ensure_layer(layer)
+
+    attr = Rhino.DocObjects.ObjectAttributes()
+    attr.LayerIndex = idx
+    if color is not None:
+        attr.ObjectColor = color
+        attr.ColorSource = Rhino.DocObjects.ObjectColorSource.ColorFromObject
+
+    doc.Objects.AddMesh(mesh, attr)
+
+
+def formdiagram_to_rhinomesh(form: FormDiagram) -> Rhino.Geometry.Mesh:
+    """Convert a FormDiagram to a Rhino mesh (lifted surface)."""
+    rm = Rhino.Geometry.Mesh()
+
+    # vertex index map
+    v_index = {}
+    for i, v in enumerate(form.vertices()):
+        x, y, z = form.vertex_coordinates(v)
+        rm.Vertices.Add(x, y, z)
+        v_index[v] = i
+
+    # faces (expect quads from meshgrid)
+    for fkey in form.faces():
+        vs = form.face_vertices(fkey)
+        if len(vs) == 4:
+            rm.Faces.AddFace(v_index[vs[0]], v_index[vs[1]], v_index[vs[2]], v_index[vs[3]])
+        elif len(vs) == 3:
+            rm.Faces.AddFace(v_index[vs[0]], v_index[vs[1]], v_index[vs[2]])
+        # else ignore
+
+    rm.Normals.ComputeNormals()
+    rm.Compact()
+    return rm
+
+
+def build_vertex_xy_lookup(form: FormDiagram, dx: float) -> Dict[Tuple[int, int], int]:
+    """
+    Dict[(ix,iy)] -> vertex key, where ix=round(x/dx), iy=round(y/dx).
+    Works because mesh is exactly on that grid.
+    """
+    lut = {}
+    for v in form.vertices():
+        x, y, _ = form.vertex_coordinates(v)
+        ix = int(round(x / dx))
+        iy = int(round(y / dx))
+        lut[(ix, iy)] = v
+    return lut
+
+
+def seam_polyline_on_surface(form: FormDiagram, seam_xy: List[Tuple[float, float]], 
+                              lut: Dict[Tuple[int, int], int], dx: float, 
+                              sample_step: int = 1) -> List[Tuple[float, float, float]]:
+    """Drape a 2D seam polyline onto the form surface using nearest grid vertex z."""
+    pts3 = []
+    for k, (x, y) in enumerate(seam_xy):
+        if sample_step > 1 and (k % sample_step) != 0 and k not in (0, len(seam_xy) - 1):
+            continue
+        ix = int(round(x / dx))
+        iy = int(round(y / dx))
+        v = lut.get((ix, iy))
+        if v is None:
+            continue
+        px, py, pz = form.vertex_coordinates(v)
+        pts3.append((px, py, pz))
+    return pts3
+
+
+def draw_polyline3d(pts3: List[Tuple[float, float, float]], layer: str) -> None:
+    """Draw a 3D polyline as connected line segments."""
+    if len(pts3) < 2:
+        return
+    for i in range(len(pts3) - 1):
+        _add_line(pts3[i], pts3[i + 1], layer)
 
 
 # ==============================================================================
@@ -606,6 +718,20 @@ def compute_metrics(form: FormDiagram, supports: List[int]) -> Dict[str, float]:
 def run(params: Dict[str, float] = None):
     params = dict(PARAMS if params is None else params)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # Unit scaling: convert meters to document units
+    # ─────────────────────────────────────────────────────────────────────────
+    U = units_per_meter()
+    unit_name = str(sc.doc.ModelUnitSystem)
+    print(f"[TNA] Document units: {unit_name}, scale factor U = {U}")
+
+    # Scale geometric parameters from meters to doc units
+    params["bay"] = float(params["bay"]) * U
+    params["zmax"] = float(params["zmax"]) * U
+    params["force_offset_x"] = float(params["force_offset_x"]) * U
+    params["force_offset_y"] = float(params["force_offset_y"]) * U
+    params["seam_draw_z"] = float(params.get("seam_draw_z", 0.02)) * U
+
     # Phase 0 — Layers: ensure they exist
     _ensure_layer(str(params["layer_form"]))
     _ensure_layer(str(params["layer_force"]))
@@ -642,6 +768,10 @@ def run(params: Dict[str, float] = None):
     traffic_sum = 0.0
     traffic_max = 0.0
 
+    # Build vertex lookup for seam draping
+    lut = build_vertex_xy_lookup(form, dx)
+    seam_sample_step = int(params.get("seam_sample_step", 2))
+
     for i in range(bx):
         for j in range(by):
             ox = i * bay
@@ -653,15 +783,30 @@ def run(params: Dict[str, float] = None):
             seams = bay_seam_polylines_9piece(ox, oy, bay, theta, r_frac=r_frac)
             seams = [snap_polyline_to_grid(pl, dx) for pl in seams]
 
-            draw_seam_polylines_in_rhino(seams, str(params["layer_seams"]), z=seam_z)
+            # Draw seams (on surface or flat)
+            if params.get("draw_seams", True):
+                if params.get("seam_draw_on_surface", True):
+                    for pl in seams:
+                        pts3 = seam_polyline_on_surface(form, pl, lut, dx, sample_step=seam_sample_step)
+                        draw_polyline3d(pts3, str(params["layer_seams"]))
+                else:
+                    draw_seam_polylines_in_rhino(seams, str(params["layer_seams"]), z=seam_z)
 
             t = seam_traffic_for_bay(form, seams, ox, oy, bay)
             traffic_sum += t
             traffic_max = max(traffic_max, t)
 
-    # Phase 5 — Draw (decimated form + force)
-    draw_form(form, params)
-    draw_force(force, params)
+    # Phase 5 — Draw form (mesh or edges)
+    if params.get("draw_form_as_mesh", True):
+        rm = formdiagram_to_rhinomesh(form)
+        _add_rhino_mesh(rm, str(params["layer_form"]), color=SD.Color.FromArgb(220, 220, 220))
+    
+    if params.get("draw_form_edges", False):
+        draw_form(form, params)
+    
+    # Draw force diagram (if enabled)
+    if params.get("draw_force_edges", False):
+        draw_force(force, params)
 
     if bool(params.get("draw_colored_forces", False)):
         draw_form_colored_by_force(form, params)
@@ -671,7 +816,13 @@ def run(params: Dict[str, float] = None):
 
     sc.doc.Views.Redraw()
 
+    # Compute total span for reporting
+    total_span_x = float(params["bay"]) * int(params["bays_x"])
+    total_span_y = float(params["bay"]) * int(params["bays_y"])
+
     print("=== TNA Funicular Floor: results ===")
+    print(f"Document units: {unit_name} (U={U})")
+    print(f"Floor span: {total_span_x:.1f} x {total_span_y:.1f} {unit_name}")
     print(f"supports (count): {len(supports)}")
     print(f"vertical scale (from zmax): {scale:.6g}")
     print(f"max edge |force| (proxy): {metrics['edge_force_max']:.6g}")

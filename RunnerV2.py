@@ -1,7 +1,7 @@
 import sys, os, importlib, traceback
 
 MODULE_DIR  = "/Users/mmg/dev/tna_playground"
-MODULE_NAME = "thrust_1_bundled"   # <-- CHANGE ONLY HERE (without .py)
+MODULE_NAME = "thrust_2"   # <-- CHANGE ONLY HERE (without .py)
 
 assert os.path.isdir(MODULE_DIR), f"MODULE_DIR not found: {MODULE_DIR}"
 print("Using module dir:", MODULE_DIR)
