@@ -3,37 +3,59 @@ import json
 import glob
 import traceback
 
-from compas.data import json_dump
+from compas.data import json_dump, DataDecoder
 from compas_rv.datastructures import FormDiagram, ThrustDiagram
+from compas_tna.diagrams import ForceDiagram
 from compas_tna.equilibrium import horizontal_nodal, vertical_from_zmax
-
 from compas.geometry import add_vectors, scale_vector, normalize_vector
 
 
-# ==========================
+# =============================================================================
 # CONFIG
-# ==========================
-SESSION_JSON = r'/Users/mmg/dev/tna_playground/JSON Files/RhinoVAULT_Fan_Vault_V2_3.json' # folder OR file
-OUT_DIR = ""  # "" = same folder as input
+# =============================================================================
+# Can be a file OR a folder (newest *.json will be picked)
+SESSION_JSON = r"/Users/mmg/dev/tna_playground/JSON Files/RhinoVAULT_Fan_Vault_V2_3.json"
 
+OUT_DIR = ""  # "" => same folder as input json
+
+# Support mode:
+# - "auto": pick 4 outer corners from boundary (quadrant-farthest)
+# - "manual": you select 4 Rhino point objects when script runs
+SUPPORT_MODE = "auto"
+MANUAL_BAKE_VERT_POINTS = False  # only used in SUPPORT_MODE="manual"
+MANUAL_POINT_LAYER = "TNA_FORM_VERTS"
+
+# Solver params
 H_KMAX = 100
 H_ALPHA = 100.0
 V_KMAX = 300
 ZMAX = None  # None => read from session if possible, else fallback 2.0
 
+# Geometry outputs
 MAKE_INTRA_EXTRA = True
 THICKNESS = 0.12
 
-DELETE_NON_EDGES = True
+# Topology cleanup
+DELETE_NON_EDGES = False  # keep False until horizontal works reliably
 DELETE_ISOLATED_VERTICES = True
 
 
-# ==========================
-# Helpers (raw dict)
-# ==========================
-def load_raw_json(path):
+# =============================================================================
+# JSON helpers
+# =============================================================================
+def resolve_json_path(path_or_folder: str) -> str:
+    if os.path.isdir(path_or_folder):
+        candidates = glob.glob(os.path.join(path_or_folder, "*.json"))
+        if not candidates:
+            raise FileNotFoundError(f"No .json files in folder: {path_or_folder}")
+        return max(candidates, key=os.path.getmtime)
+    return path_or_folder
+
+
+def load_raw_json(path: str):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
 
 def walk_nodes(node):
     if isinstance(node, dict):
@@ -44,18 +66,19 @@ def walk_nodes(node):
         for v in node:
             yield from walk_nodes(v)
 
-def find_first_dtype(root, dtype_exact):
+
+def find_first_dtype(root, dtype_exact: str):
     for n in walk_nodes(root):
         if n.get("dtype") == dtype_exact and "data" in n:
             return n
     return None
 
+
 def read_zmax_from_session(session_dict):
-    # robust: try a few common locations
     for path in [
-        ("scene","data","settings","tna","vertical_zmax"),
-        ("settings","tna","vertical_zmax"),
-        ("data","settings","tna","vertical_zmax"),
+        ("scene", "data", "settings", "tna", "vertical_zmax"),
+        ("settings", "tna", "vertical_zmax"),
+        ("data", "settings", "tna", "vertical_zmax"),
     ]:
         try:
             d = session_dict
@@ -66,20 +89,26 @@ def read_zmax_from_session(session_dict):
             pass
     return None
 
+
+def decode_compas_item(dtype: str, data):
+    """Decode a COMPAS item from {dtype,data} using DataDecoder (works in your env via json.loads)."""
+    payload = {"dtype": dtype, "data": data}
+    return json.loads(json.dumps(payload), cls=DataDecoder)
+
+
+# =============================================================================
+# Diagram helpers
+# =============================================================================
 def delete_non_edges(diagram):
-    # Robust across COMPAS versions (has_edge signature differs)
     to_delete = []
     for edge in list(diagram.edges()):
-        # edge is typically a tuple (u, v)
         if diagram.edge_attribute(edge, "_is_edge") is False:
             to_delete.append(edge)
 
     for edge in to_delete:
-        # safest: just attempt delete; edge came from diagram.edges() anyway
         try:
             diagram.delete_edge(edge)
         except Exception:
-            # older versions may want u, v separately
             try:
                 u, v = edge
                 diagram.delete_edge(u, v)
@@ -95,6 +124,126 @@ def delete_isolated_vertices(diagram):
         diagram.delete_vertex(v)
     return len(isolated)
 
+
+def reindex_edges_consecutively(diagram):
+    """Force edge 'index' to be 0..m-1 (prevents ForceDiagram.ordered_edges KeyError)."""
+    edges = list(diagram.edges())
+    for i, e in enumerate(edges):
+        diagram.edge_attribute(e, "index", i)
+
+    idx = [diagram.edge_attribute(e, "index") for e in edges]
+    missing = set(range(len(edges))) - set(idx)
+    return {
+        "m": len(edges),
+        "missing_count": len(missing),
+        "min": min(idx) if idx else None,
+        "max": max(idx) if idx else None,
+    }
+
+
+# =============================================================================
+# Support selection
+# =============================================================================
+def boundary_vertices(form):
+    """Boundary vertices (outer + inner)."""
+    b = set()
+    for e in form.edges():
+        faces = form.edge_faces(e)
+        real = [f for f in faces if f is not None]
+        if len(real) == 1:
+            u, v = e
+            b.add(u)
+            b.add(v)
+    return list(b)
+
+
+def xy(form, v):
+    return (form.vertex_attribute(v, "x"), form.vertex_attribute(v, "y"))
+
+
+def quadrant_key(cx, cy, x, y):
+    if x >= cx and y >= cy:
+        return "NE"
+    if x < cx and y >= cy:
+        return "NW"
+    if x < cx and y < cy:
+        return "SW"
+    return "SE"
+
+
+def pick_4_corner_supports_by_quadrant(form, candidates):
+    xs = [xy(form, v)[0] for v in candidates]
+    ys = [xy(form, v)[1] for v in candidates]
+    cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
+
+    best = {"NE": (None, -1), "NW": (None, -1), "SW": (None, -1), "SE": (None, -1)}
+    for v in candidates:
+        x, y = xy(form, v)
+        q = quadrant_key(cx, cy, x, y)
+        d2 = (x - cx) ** 2 + (y - cy) ** 2
+        if d2 > best[q][1]:
+            best[q] = (v, d2)
+
+    supports = [best["NW"][0], best["NE"][0], best["SE"][0], best["SW"][0]]
+    return [v for v in supports if v is not None]
+
+
+def apply_supports(form, supports):
+    for v in form.vertices():
+        form.vertex_attribute(v, "is_fixed", False)
+    for v in supports:
+        form.vertex_attribute(v, "is_fixed", True)
+
+
+def bake_form_vertices_as_points(form, layer_name):
+    import rhinoscriptsyntax as rs
+
+    if not rs.IsLayer(layer_name):
+        rs.AddLayer(layer_name)
+    rs.CurrentLayer(layer_name)
+
+    guids = []
+    for v in form.vertices():
+        x = form.vertex_attribute(v, "x")
+        y = form.vertex_attribute(v, "y")
+        z = form.vertex_attribute(v, "z") or 0.0
+        g = rs.AddPoint(x, y, z)
+        if g:
+            guids.append(g)
+    return guids
+
+
+def set_supports_from_selected_points(form):
+    import rhinoscriptsyntax as rs
+
+    guids = rs.GetObjects("Select 4 support point objects (preselect ok) then Enter", rs.filter.point, preselect=True)
+    if not guids:
+        return []
+
+    picked = [rs.PointCoordinates(g) for g in guids]
+    verts = list(form.vertices())
+    supports = []
+
+    for px, py, pz in picked:
+        best = None
+        bestd = 1e99
+        for v in verts:
+            x = form.vertex_attribute(v, "x")
+            y = form.vertex_attribute(v, "y")
+            d = (x - px) ** 2 + (y - py) ** 2
+            if d < bestd:
+                bestd = d
+                best = v
+        if best is not None and best not in supports:
+            supports.append(best)
+
+    apply_supports(form, supports)
+    return supports
+
+
+# =============================================================================
+# Intrados / extrados
+# =============================================================================
 def mesh_vertex_normals(mesh):
     vnormals = {v: [0.0, 0.0, 0.0] for v in mesh.vertices()}
     for f in mesh.faces():
@@ -105,6 +254,7 @@ def mesh_vertex_normals(mesh):
         vnormals[v] = normalize_vector(vnormals[v])
     return vnormals
 
+
 def offset_mesh_along_normals(mesh, offset):
     out = mesh.copy()
     VN = mesh_vertex_normals(mesh)
@@ -114,245 +264,89 @@ def offset_mesh_along_normals(mesh, offset):
         out.vertex_attributes(v, "xyz", add_vectors(p, scale_vector(n, offset)))
     return out
 
-def boundary_vertices(form):
-    """Return boundary vertices (both outer + inner boundaries)."""
-    b = set()
-    for e in form.edges():
-        faces = form.edge_faces(e)
-        real = [f for f in faces if f is not None]
-        if len(real) == 1:
-            u, v = e
-            b.add(u); b.add(v)
-    return list(b)
 
-def xy(form, v):
-    return (form.vertex_attribute(v, "x"), form.vertex_attribute(v, "y"))
-
-def quadrant_key(cx, cy, x, y):
-    # NE, NW, SW, SE
-    if x >= cx and y >= cy: return "NE"
-    if x <  cx and y >= cy: return "NW"
-    if x <  cx and y <  cy: return "SW"
-    return "SE"
-
-def pick_4_corner_supports_by_quadrant(form, candidates):
-    # centroid
-    xs = [xy(form,v)[0] for v in candidates]
-    ys = [xy(form,v)[1] for v in candidates]
-    cx, cy = sum(xs)/len(xs), sum(ys)/len(ys)
-
-    # pick farthest point in each quadrant
-    best = {"NE": (None, -1), "NW": (None, -1), "SW": (None, -1), "SE": (None, -1)}
-    for v in candidates:
-        x, y = xy(form, v)
-        q = quadrant_key(cx, cy, x, y)
-        d2 = (x-cx)**2 + (y-cy)**2
-        if d2 > best[q][1]:
-            best[q] = (v, d2)
-
-    supports = [best["NW"][0], best["NE"][0], best["SE"][0], best["SW"][0]]
-    supports = [v for v in supports if v is not None]
-    return supports
-
-def k_ring_vertices(form, seeds, k=1):
-    """Graph BFS expansion k steps from seed vertices."""
-    current = set(seeds)
-    visited = set(seeds)
-    for _ in range(k):
-        nxt = set()
-        for v in current:
-            for nbr in form.vertex_neighbors(v):
-                if nbr not in visited:
-                    nxt.add(nbr)
-        visited |= nxt
-        current = nxt
-    return list(visited)
-
-def apply_supports(form, supports):
-    for v in form.vertices():
-        form.vertex_attribute(v, "is_fixed", False)
-    for v in supports:
-        form.vertex_attribute(v, "is_fixed", True)
-
-# ==========================
-# Entry point for RunnerV2
-# ==========================
+# =============================================================================
+# RunnerV2 entry point
+# =============================================================================
 def run():
     dbg = {}
-
     try:
-        # 1) Resolve input (folder -> newest json)
-        path = SESSION_JSON
-        if os.path.isdir(path):
-            candidates = glob.glob(os.path.join(path, "*.json"))
-            if not candidates:
-                raise FileNotFoundError(f"No .json files in folder: {path}")
-            path = max(candidates, key=os.path.getmtime)
-
+        path = resolve_json_path(SESSION_JSON)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"SESSION_JSON not found: {path}")
-
         dbg["session_path"] = path
 
-        # 2) Load raw dict and find Pattern node
         session_dict = load_raw_json(path)
 
         PAT_DTYPE = "compas_rv.datastructures/Pattern"
         pat_node = find_first_dtype(session_dict, PAT_DTYPE)
         if not pat_node:
-            dbg["available_dtypes_sample"] = sorted(
-                {n.get("dtype") for n in walk_nodes(session_dict) if isinstance(n.get("dtype"), str)}
-            )[:50]
             raise Exception(f"Pattern dtype not found: {PAT_DTYPE}")
 
-        # 3) Decode the Pattern in a version-safe way
-        pattern = None
+        pattern = decode_compas_item(pat_node["dtype"], pat_node["data"])
+        dbg["pattern_decode_method"] = "json.loads(..., cls=DataDecoder)"
 
-        # 3) Decode the Pattern in a version-safe way
-        from compas.data import DataDecoder
-
-        payload = {"dtype": pat_node["dtype"], "data": pat_node["data"]}
-
-        try:
-            pattern = json.loads(json.dumps(payload), cls=DataDecoder)
-            dbg["pattern_decode_method"] = "json.loads(..., cls=DataDecoder)"
-        except Exception as e:
-            dbg["pattern_decode_method"] = "FAILED"
-            dbg["pattern_decode_error"] = str(e)
-            pattern = None
-
-        if pattern is None:
-            raise Exception("Could not decode Pattern (DataDecoder failed).")
-
-
-        # 3b) Fallback: Pattern.from_data (if available)
-        if pattern is None:
-            from compas_rv.datastructures import Pattern
-            dbg["Pattern_has_from_data"] = hasattr(Pattern, "from_data")
-            if hasattr(Pattern, "from_data"):
-                pattern = Pattern.from_data(pat_node["data"])
-
-        if pattern is None:
-            raise Exception("Could not decode Pattern (no decoder available in this environment).")
-
-        # 4) Build clean FormDiagram from Pattern
         form = FormDiagram.from_pattern(pattern)
+        dbg["form_VEF"] = (form.number_of_vertices(), form.number_of_edges(), form.number_of_faces())
 
-        fixed_from_pattern = 0
-        for v in form.vertices():
-            if pattern.has_vertex(v):
-                is_fixed = bool(pattern.vertex_attribute(v, "is_fixed") or pattern.vertex_attribute(v, "is_support"))
-                if is_fixed:
-                    form.vertex_attribute(v, "is_fixed", True)
-                    fixed_from_pattern += 1
+        # Supports
+        if SUPPORT_MODE.lower() == "manual":
+            if MANUAL_BAKE_VERT_POINTS:
+                dbg["baked_points"] = len(bake_form_vertices_as_points(form, MANUAL_POINT_LAYER))
+            supports = set_supports_from_selected_points(form)
+            dbg["supports_mode"] = "manual"
+        else:
+            bverts = boundary_vertices(form)
+            supports = pick_4_corner_supports_by_quadrant(form, bverts)
+            apply_supports(form, supports)
+            dbg["supports_mode"] = "auto"
 
-        dbg["fixed_from_pattern"] = fixed_from_pattern
+        dbg["supports"] = supports
+        dbg["fixed_count"] = len([v for v in form.vertices() if form.vertex_attribute(v, "is_fixed")])
 
-        dbg["form_VEF_before_clean"] = (form.number_of_vertices(), form.number_of_edges(), form.number_of_faces())
-
-        # 4.5) Auto-apply supports if none exist
-        bverts = boundary_vertices(form)
-
-        # If you have an inner hole, bverts includes inner + outer boundary.
-        # This quadrant method usually still selects the OUTER corners because they are farthest from centroid.
-        supports = pick_4_corner_supports_by_quadrant(form, bverts)
-
-        # If you want 1-ring (first “row” around each corner):
-        supports_strip = k_ring_vertices(form, supports, k=1)
-
-        apply_supports(form, supports)          # 4 points only (recommended)
-        # apply_supports(form, supports_strip)  # corner strip (use only if needed)
-
-        dbg["supports_4"] = supports
-        dbg["supports_strip_count"] = len(supports_strip)
-
-
-        # 5) Cleanup
-        deleted_non = 0
-        deleted_iso = 0
+        # Cleanup
         if DELETE_NON_EDGES:
-            deleted_non = delete_non_edges(form)
+            dbg["deleted_non_edges"] = delete_non_edges(form)
         if DELETE_ISOLATED_VERTICES:
-            deleted_iso = delete_isolated_vertices(form)
-
-        dbg["deleted_non_edges"] = deleted_non
-        dbg["deleted_isolated_vertices"] = deleted_iso
+            dbg["deleted_isolated_vertices"] = delete_isolated_vertices(form)
         dbg["form_VEF_after_clean"] = (form.number_of_vertices(), form.number_of_edges(), form.number_of_faces())
 
-        # 6) Build thrust diagram (version-safe)
-        thrust = None
-
-        # Try: form.copy(cls=ThrustDiagram) if your FormDiagram supports it
+        # Thrust diagram (copy)
         try:
             thrust = form.copy(cls=ThrustDiagram)
             dbg["thrust_build"] = "form.copy(cls=ThrustDiagram)"
         except Exception as e:
-            dbg["thrust_copy_cls_error"] = str(e)
-
-        # Fallback: plain copy (still works as datastructure for equilibrium solvers)
-        if thrust is None:
             thrust = form.copy()
             dbg["thrust_build"] = "form.copy()"
+            dbg["thrust_copy_cls_error"] = str(e)
 
-                # Ensure supports exist (RV sessions usually have is_fixed / is_support on vertices)
-        # If none exist, the solver will fail.
-        fixed = [v for v in thrust.vertices() if thrust.vertex_attribute(v, "is_fixed")]
-        dbg["fixed_count"] = len(fixed)
-
-        from compas_tna.diagrams import ForceDiagram
+        # CRITICAL: reindex edges to avoid ordered_edges KeyError
+        dbg["thrust_edge_index"] = reindex_edges_consecutively(thrust)
 
         force = ForceDiagram.from_formdiagram(thrust)
         dbg["force_VEF"] = (force.number_of_vertices(), force.number_of_edges(), force.number_of_faces())
+        dbg["force_edge_index"] = reindex_edges_consecutively(force)
 
+        # Horizontal equilibrium
         horizontal_nodal(thrust, force, kmax=H_KMAX, alpha=H_ALPHA)
         dbg["horizontal_ok"] = True
 
-
-        # Ensure force densities q exist
-        # Some sessions store 'q' already, but we set a default if missing.
-        q_missing = 0
-        for e in thrust.edges():
-            if thrust.edge_attribute(e, "q") is None:
-                thrust.edge_attribute(e, "q", 1.0)
-                q_missing += 1
-        dbg["q_defaulted_edges"] = q_missing
-
-        # Ensure nodal loads exist (px,py,pz); default to 0 if missing
-        load_missing = 0
-        for v in thrust.vertices():
-            if thrust.vertex_attribute(v, "px") is None:
-                thrust.vertex_attribute(v, "px", 0.0); load_missing += 1
-            if thrust.vertex_attribute(v, "py") is None:
-                thrust.vertex_attribute(v, "py", 0.0)
-            if thrust.vertex_attribute(v, "pz") is None:
-                thrust.vertex_attribute(v, "pz", 0.0)
-        dbg["load_defaulted_vertices"] = load_missing
-
-
-        zmax = ZMAX
-        if zmax is None:
-            zmax = read_zmax_from_session(session_dict) or 2.0
+        # Vertical equilibrium
+        zmax = ZMAX if ZMAX is not None else (read_zmax_from_session(session_dict) or 2.0)
         dbg["zmax_used"] = zmax
 
-        from compas_tna.diagrams import ForceDiagram
-        force = ForceDiagram.from_formdiagram(thrust)  # or from_formdiagram(form) — both share same topo
-        dbg["force_VEF"] = (force.number_of_vertices(), force.number_of_edges(), force.number_of_faces())
-
-
-        horizontal_nodal(thrust, force, kmax=H_KMAX, alpha=H_ALPHA)
-        
         vertical_from_zmax(thrust, zmax=zmax, kmax=V_KMAX)
+        dbg["vertical_ok"] = True
 
         dbg["thrust_VEF"] = (thrust.number_of_vertices(), thrust.number_of_edges(), thrust.number_of_faces())
 
-        # 7) Intrados/extrados
         intrados = extrados = None
         if MAKE_INTRA_EXTRA:
             half = 0.5 * float(THICKNESS)
             intrados = offset_mesh_along_normals(thrust, -half)
             extrados = offset_mesh_along_normals(thrust, +half)
 
-        # 8) Save outputs
+        # Save
         base = os.path.splitext(os.path.basename(path))[0]
         out_dir = OUT_DIR or os.path.dirname(path)
         os.makedirs(out_dir, exist_ok=True)
@@ -373,19 +367,9 @@ def run():
             "ok": True,
             "session": path,
             "out_dir": out_dir,
-            "files": {
-                "form": out_form,
-                "thrust": out_thrust,
-                "intrados": out_intra,
-                "extrados": out_extra,
-            },
-            "dbg": dbg
+            "files": {"form": out_form, "thrust": out_thrust, "intrados": out_intra, "extrados": out_extra},
+            "dbg": dbg,
         }
 
     except Exception:
-        return {
-            "ok": False,
-            "session": dbg.get("session_path", SESSION_JSON),
-            "error": traceback.format_exc(),
-            "dbg": dbg
-        }
+        return {"ok": False, "session": dbg.get("session_path", SESSION_JSON), "error": traceback.format_exc(), "dbg": dbg}
