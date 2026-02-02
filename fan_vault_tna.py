@@ -114,6 +114,65 @@ def offset_mesh_along_normals(mesh, offset):
         out.vertex_attributes(v, "xyz", add_vectors(p, scale_vector(n, offset)))
     return out
 
+def boundary_vertices(form):
+    """Return boundary vertices (both outer + inner boundaries)."""
+    b = set()
+    for e in form.edges():
+        faces = form.edge_faces(e)
+        real = [f for f in faces if f is not None]
+        if len(real) == 1:
+            u, v = e
+            b.add(u); b.add(v)
+    return list(b)
+
+def xy(form, v):
+    return (form.vertex_attribute(v, "x"), form.vertex_attribute(v, "y"))
+
+def quadrant_key(cx, cy, x, y):
+    # NE, NW, SW, SE
+    if x >= cx and y >= cy: return "NE"
+    if x <  cx and y >= cy: return "NW"
+    if x <  cx and y <  cy: return "SW"
+    return "SE"
+
+def pick_4_corner_supports_by_quadrant(form, candidates):
+    # centroid
+    xs = [xy(form,v)[0] for v in candidates]
+    ys = [xy(form,v)[1] for v in candidates]
+    cx, cy = sum(xs)/len(xs), sum(ys)/len(ys)
+
+    # pick farthest point in each quadrant
+    best = {"NE": (None, -1), "NW": (None, -1), "SW": (None, -1), "SE": (None, -1)}
+    for v in candidates:
+        x, y = xy(form, v)
+        q = quadrant_key(cx, cy, x, y)
+        d2 = (x-cx)**2 + (y-cy)**2
+        if d2 > best[q][1]:
+            best[q] = (v, d2)
+
+    supports = [best["NW"][0], best["NE"][0], best["SE"][0], best["SW"][0]]
+    supports = [v for v in supports if v is not None]
+    return supports
+
+def k_ring_vertices(form, seeds, k=1):
+    """Graph BFS expansion k steps from seed vertices."""
+    current = set(seeds)
+    visited = set(seeds)
+    for _ in range(k):
+        nxt = set()
+        for v in current:
+            for nbr in form.vertex_neighbors(v):
+                if nbr not in visited:
+                    nxt.add(nbr)
+        visited |= nxt
+        current = nxt
+    return list(visited)
+
+def apply_supports(form, supports):
+    for v in form.vertices():
+        form.vertex_attribute(v, "is_fixed", False)
+    for v in supports:
+        form.vertex_attribute(v, "is_fixed", True)
 
 # ==========================
 # Entry point for RunnerV2
@@ -190,6 +249,23 @@ def run():
         dbg["fixed_from_pattern"] = fixed_from_pattern
 
         dbg["form_VEF_before_clean"] = (form.number_of_vertices(), form.number_of_edges(), form.number_of_faces())
+
+        # 4.5) Auto-apply supports if none exist
+        bverts = boundary_vertices(form)
+
+        # If you have an inner hole, bverts includes inner + outer boundary.
+        # This quadrant method usually still selects the OUTER corners because they are farthest from centroid.
+        supports = pick_4_corner_supports_by_quadrant(form, bverts)
+
+        # If you want 1-ring (first “row” around each corner):
+        supports_strip = k_ring_vertices(form, supports, k=1)
+
+        apply_supports(form, supports)          # 4 points only (recommended)
+        # apply_supports(form, supports_strip)  # corner strip (use only if needed)
+
+        dbg["supports_4"] = supports
+        dbg["supports_strip_count"] = len(supports_strip)
+
 
         # 5) Cleanup
         deleted_non = 0
