@@ -18,6 +18,8 @@ INTRADOS_JSON = os.path.join(OUT_DIR, "RhinoVAULT_INTRADOS.json")
 EXTRADOS_JSON = os.path.join(OUT_DIR, "RhinoVAULT_EXTRADOS.json")
 
 BAKE_AS_BREP = True          # try Brep first
+BAKE_BOTH = True   # bake BOTH brep-attempt and raw mesh for comparison
+
 BAKE_EDGES   = True          # bake thrust edges as curves
 CLEAR_LAYER  = False         # if True, deletes existing objs on the target layers before baking
 
@@ -98,10 +100,13 @@ def compas_mesh_to_rhino_mesh(mesh):
     return rm
 
 
-def bake_mesh_or_brep(rmesh, layer_fullname, name):
+def bake_mesh_and_or_brep(rmesh, layer_fullname, name):
     """
-    Try Brep-from-Mesh if enabled, else bake mesh.
-    Returns dict with baked ids and what was baked.
+    If BAKE_BOTH:
+      - always bake the raw mesh (stable reference)
+      - also try Brep-from-mesh and bake it if it succeeds
+    Else:
+      - behave like before (try brep then fallback to mesh)
     """
     layer_fullname = ensure_layer(layer_fullname)
     layer_index = sc.doc.Layers.FindByFullPath(layer_fullname, True)
@@ -110,22 +115,47 @@ def bake_mesh_or_brep(rmesh, layer_fullname, name):
     attr.LayerIndex = layer_index
     attr.Name = name
 
-    baked = {"layer": layer_fullname, "name": name, "mode": None, "ids": []}
+    baked = {"layer": layer_fullname, "name": name, "mesh_id": None, "brep_id": None, "brep_ok": False}
 
+    # Always compute some stability improvements for the mesh
+    rmesh.Normals.ComputeNormals()
+    rmesh.Compact()
+
+    # Always bake mesh if BAKE_BOTH, or if brep attempt fails
+    def bake_mesh():
+        gid = sc.doc.Objects.AddMesh(rmesh, attr)
+        if gid != System.Guid.Empty:
+            baked["mesh_id"] = str(gid)
+
+    if BAKE_BOTH:
+        # bake mesh reference first
+        bake_mesh()
+
+        # try brep as a comparison object
+        if BAKE_AS_BREP:
+            brep = Rhino.Geometry.Brep.CreateFromMesh(rmesh, True)
+            if brep:
+                gid = sc.doc.Objects.AddBrep(brep, attr)
+                if gid != System.Guid.Empty:
+                    baked["brep_ok"] = True
+                    baked["brep_id"] = str(gid)
+
+        return baked
+
+    # old behavior: try brep first, else mesh
     if BAKE_AS_BREP:
         brep = Rhino.Geometry.Brep.CreateFromMesh(rmesh, True)
         if brep:
             gid = sc.doc.Objects.AddBrep(brep, attr)
-            if gid != Rhino.Geometry.Guid.Empty:
-                baked["mode"] = "brep"
-                baked["ids"].append(str(gid))
+            if gid != System.Guid.Empty:
+                baked["brep_ok"] = True
+                baked["brep_id"] = str(gid)
                 return baked
 
-    # fallback mesh
-    gid = sc.doc.Objects.AddMesh(rmesh, attr)
-    baked["mode"] = "mesh"
-    baked["ids"].append(str(gid))
+    # fallback to mesh
+    bake_mesh()
     return baked
+
 
 
 def bake_thrust_edges(mesh_like, layer_fullname, name_prefix="edge"):
@@ -193,9 +223,9 @@ def run():
 
         # bake
         baked = {}
-        baked["thrust"]   = bake_mesh_or_brep(r_thrust,   L_THRUST,   "THRUST_SOLVED")
-        baked["intrados"] = bake_mesh_or_brep(r_intrados, L_INTRADOS, "INTRADOS")
-        baked["extrados"] = bake_mesh_or_brep(r_extrados, L_EXTRADOS, "EXTRADOS")
+        baked["thrust"]   = bake_mesh_and_or_brep(r_thrust,   L_THRUST,   "THRUST_SOLVED")
+        baked["intrados"] = bake_mesh_and_or_brep(r_intrados, L_INTRADOS, "INTRADOS")
+        baked["extrados"] = bake_mesh_and_or_brep(r_extrados, L_EXTRADOS, "EXTRADOS")
 
         if BAKE_EDGES:
             baked["edges"] = {
