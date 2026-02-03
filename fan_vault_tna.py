@@ -21,8 +21,8 @@ OUT_DIR = ""  # "" => same folder as input json
 # Support mode:
 # - "auto": pick 4 outer corners from boundary (quadrant-farthest)
 # - "manual": you select 4 Rhino point objects when script runs
-SUPPORT_MODE = "auto"
-MANUAL_BAKE_VERT_POINTS = False  # only used in SUPPORT_MODE="manual"
+SUPPORT_MODE = "manual"
+MANUAL_BAKE_VERT_POINTS = True  # only used in SUPPORT_MODE="manual"
 MANUAL_POINT_LAYER = "TNA_FORM_VERTS"
 
 # Solver params
@@ -140,6 +140,74 @@ def reindex_edges_consecutively(diagram):
         "max": max(idx) if idx else None,
     }
 
+
+def reindex_interior_edges(form):
+    """
+    Index ONLY interior edges (those with 2 adjacent faces) as 0..m-1.
+    Boundary edges get index=None.
+    This matches ForceDiagram.ordered_edges(form) expectations.
+    """
+    interior = []
+    boundary_like = 0
+
+    for e in list(form.edges()):
+        faces = form.edge_faces(e)
+        real = [f for f in faces if f is not None]
+        if len(real) == 2:
+            interior.append(e)
+        else:
+            boundary_like += 1
+            form.edge_attribute(e, "index", None)
+
+    for i, e in enumerate(interior):
+        form.edge_attribute(e, "index", i)
+
+    return {
+        "total_edges": form.number_of_edges(),
+        "interior_edges": len(interior),
+        "boundary_like_edges": boundary_like,
+        "index_min": 0 if interior else None,
+        "index_max": (len(interior) - 1) if interior else None,
+    }
+
+def reindex_form_edges_from_force(form, force):
+    """
+    ForceDiagram edges store which form edge they correspond to (usually under 'uv').
+    Use that mapping to index ONLY the dual-able form edges consecutively.
+    """
+    uv_edges = []
+    for e in force.edges():
+        uv = force.edge_attribute(e, "uv")
+        if uv is None:
+            continue
+        # uv can be (u,v) or [u,v]
+        uv = tuple(uv)
+        uv_edges.append(uv)
+
+    # remove duplicates while keeping order
+    seen = set()
+    ordered_uv = []
+    for uv in uv_edges:
+        if uv not in seen and (uv[1], uv[0]) not in seen:
+            ordered_uv.append(uv)
+            seen.add(uv)
+
+    # reset all indices
+    for e in form.edges():
+        form.edge_attribute(e, "index", None)
+
+    # apply consecutive indices to the dual edges only
+    for i, uv in enumerate(ordered_uv):
+        u, v = uv
+        if form.has_edge((u, v)):
+            form.edge_attribute((u, v), "index", i)
+        elif form.has_edge((v, u)):
+            form.edge_attribute((v, u), "index", i)
+        else:
+            # mapping refers to an edge not present -> will break, record it
+            pass
+
+    return {"dual_edges": len(ordered_uv), "index_max": len(ordered_uv) - 1}
 
 # =============================================================================
 # Support selection
@@ -286,6 +354,14 @@ def run():
         pattern = decode_compas_item(pat_node["dtype"], pat_node["data"])
         dbg["pattern_decode_method"] = "json.loads(..., cls=DataDecoder)"
 
+        import compas, compas_tna, compas_rv
+        dbg["compas_file"] = compas.__file__
+        dbg["compas_tna_file"] = compas_tna.__file__
+        dbg["compas_rv_file"] = compas_rv.__file__
+        dbg["force_class_module"] = ForceDiagram.__module__
+        dbg["force_class_mro"] = [c.__module__ + "." + c.__name__ for c in ForceDiagram.__mro__]
+
+
         form = FormDiagram.from_pattern(pattern)
         dbg["form_VEF"] = (form.number_of_vertices(), form.number_of_edges(), form.number_of_faces())
 
@@ -320,12 +396,16 @@ def run():
             dbg["thrust_build"] = "form.copy()"
             dbg["thrust_copy_cls_error"] = str(e)
 
-        # CRITICAL: reindex edges to avoid ordered_edges KeyError
-        dbg["thrust_edge_index"] = reindex_edges_consecutively(thrust)
+       # CRITICAL: index only interior edges of the form/thrust
+        dbg["thrust_interior_index"] = reindex_interior_edges(thrust)
 
+        # build force from thrust (do NOT reindex force afterwards)
         force = ForceDiagram.from_formdiagram(thrust)
         dbg["force_VEF"] = (force.number_of_vertices(), force.number_of_edges(), force.number_of_faces())
-        dbg["force_edge_index"] = reindex_edges_consecutively(force)
+
+        horizontal_nodal(thrust, force, kmax=H_KMAX, alpha=H_ALPHA)
+        dbg["horizontal_ok"] = True
+
 
         # Horizontal equilibrium
         horizontal_nodal(thrust, force, kmax=H_KMAX, alpha=H_ALPHA)
