@@ -15,7 +15,8 @@ from compas_tna.equilibrium import horizontal_nodal, vertical_from_zmax
 # ==========================
 # CONFIG (edit these)
 # ==========================
-SESSION_JSON = r"/Users/mmg/dev/tna_playground/JSON Files/RhinoVAULT.json"  # file OR folder
+SESSION_JSON = r'/Users/mmg/dev/tna_playground/JSON Files/Pattern_simple_v2.json'
+  # file OR folder
 OUT_DIR = ""  # "" => same folder as input
 
 # Solver controls
@@ -24,11 +25,11 @@ H_ALPHA = 100.0
 V_KMAX = 300
 
 # If None, try to read from RV session settings, else fallback 2.0
-ZMAX = None
+ZMAX = 2.4
 
 # Intrados / extrados output
 MAKE_INTRA_EXTRA = True
-THICKNESS = 0.12
+THICKNESS = 0.24
 
 # Cleanups
 DELETE_NON_EDGES = True
@@ -463,6 +464,55 @@ def run():
         vertical_from_zmax(thrust, zmax=zmax, kmax=V_KMAX)
         dbg["vertical_ok"] = True
 
+        # --- forces ---
+        # --- edge forces (N) + support reactions ---
+        edge_forces = {}
+        for u, v in thrust.edges():
+            q = thrust.edge_attribute((u, v), "q") or 0.0
+            xi = thrust.vertex_coordinates(u)
+            xj = thrust.vertex_coordinates(v)
+            dx = (xj[0] - xi[0], xj[1] - xi[1], xj[2] - xi[2])
+            L = (dx[0]**2 + dx[1]**2 + dx[2]**2) ** 0.5
+            N = q * L  # axial force magnitude
+            thrust.edge_attribute((u, v), "N", float(N))
+            edge_forces[f"{u}-{v}"] = {"q": float(q), "L": float(L), "N": float(N)}
+
+        # reactions only on supports
+        reactions = {}
+        for i in thrust.vertices():
+            if not thrust.vertex_attribute(i, "is_fixed"):
+                continue
+
+            xi = thrust.vertex_coordinates(i)
+
+            # sum of q*(xj - xi) over neighbors
+            sx = sy = sz = 0.0
+            for j in thrust.vertex_neighbors(i):
+                qij = thrust.edge_attribute((i, j), "q")
+                if qij is None:
+                    qij = thrust.edge_attribute((j, i), "q")
+                qij = qij or 0.0
+
+                xj = thrust.vertex_coordinates(j)
+                sx += qij * (xj[0] - xi[0])
+                sy += qij * (xj[1] - xi[1])
+                sz += qij * (xj[2] - xi[2])
+
+            px = thrust.vertex_attribute(i, "px") or 0.0
+            py = thrust.vertex_attribute(i, "py") or 0.0
+            pz = thrust.vertex_attribute(i, "pz") or 0.0
+
+            Rx = -(sx + px)
+            Ry = -(sy + py)
+            Rz = -(sz + pz)
+
+            thrust.vertex_attributes(i, ["Rx", "Ry", "Rz"], [float(Rx), float(Ry), float(Rz)])
+            reactions[str(i)] = {"Rx": float(Rx), "Ry": float(Ry), "Rz": float(Rz)}
+
+        dbg["edge_forces_computed"] = len(edge_forces)
+        dbg["support_reactions_computed"] = len(reactions)
+
+
         # --- intrados/extrados ---
         intrados = extrados = None
         if MAKE_INTRA_EXTRA:
@@ -475,8 +525,11 @@ def run():
         out_dir = OUT_DIR or os.path.dirname(path)
         os.makedirs(out_dir, exist_ok=True)
 
+        #here
         out_form = os.path.join(out_dir, f"{base}_FORM_REBUILT.json")
         out_thrust = os.path.join(out_dir, f"{base}_THRUST_SOLVED.json")
+        out_force = os.path.join(out_dir, f"{base}_FORCE.json")
+        json_dump(force, out_force)
         json_dump(form, out_form)
         json_dump(thrust, out_thrust)
 
@@ -496,6 +549,7 @@ def run():
                 "thrust": out_thrust,
                 "intrados": out_intra,
                 "extrados": out_extra,
+                "force": out_force,
             },
             "dbg": dbg,
         }

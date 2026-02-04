@@ -13,14 +13,17 @@ import scriptcontext as sc
 
 OUT_DIR = r"/Users/mmg/dev/tna_playground/JSON Files"
 
-THRUST_JSON   = os.path.join(OUT_DIR, "RhinoVAULT_THRUST_SOLVED.json")
-INTRADOS_JSON = os.path.join(OUT_DIR, "RhinoVAULT_INTRADOS.json")
-EXTRADOS_JSON = os.path.join(OUT_DIR, "RhinoVAULT_EXTRADOS.json")
+THRUST_JSON   = os.path.join(OUT_DIR, "Pattern_simple_v2_THRUST_SOLVED.json")
+INTRADOS_JSON = os.path.join(OUT_DIR, "Pattern_simple_v2_INTRADOS.json")
+EXTRADOS_JSON = os.path.join(OUT_DIR, "Pattern_simple_v2_EXTRADOS.json")
+FORCE_JSON = os.path.join(OUT_DIR, "Pattern_simple_v2_FORCE.json")
+
 
 BAKE_AS_BREP = True          # try Brep first
 BAKE_BOTH = True   # bake BOTH brep-attempt and raw mesh for comparison
 
 BAKE_EDGES   = True          # bake thrust edges as curves
+BAKE_FORCE   = True         # bake force diagram edges as curves
 CLEAR_LAYER  = False         # if True, deletes existing objs on the target layers before baking
 
 
@@ -175,10 +178,9 @@ def bake_thrust_edges(mesh_like, layer_fullname, name_prefix="edge"):
         b = Rhino.Geometry.Point3d(*mesh_like.vertex_coordinates(v))
         crv = Rhino.Geometry.LineCurve(a, b)
         gid = sc.doc.Objects.AddCurve(crv, attr)
-        if gid != Rhino.Geometry.Guid.Empty:
+        if gid != System.Guid.Empty:
             ids.append(str(gid))
     return ids
-
 
 # ==========================
 # ENTRYPOINT FOR RunnerV2
@@ -188,18 +190,20 @@ def run():
 
     dbg = {}
     try:
-        for p in (THRUST_JSON, INTRADOS_JSON, EXTRADOS_JSON):
+        for p in (THRUST_JSON, INTRADOS_JSON, EXTRADOS_JSON, FORCE_JSON):
             if not os.path.isfile(p):
                 raise FileNotFoundError("Missing JSON: {}".format(p))
 
         thrust   = json_load(THRUST_JSON)
         intrados = json_load(INTRADOS_JSON)
         extrados = json_load(EXTRADOS_JSON)
+        force = json_load(FORCE_JSON)
 
         dbg["loaded"] = {
             "thrust": THRUST_JSON,
             "intrados": INTRADOS_JSON,
             "extrados": EXTRADOS_JSON,
+            "force": FORCE_JSON,
         }
 
         # layers
@@ -207,6 +211,7 @@ def run():
         L_INTRADOS = "TNA::INTRADOS"
         L_EXTRADOS = "TNA::EXTRADOS"
         L_EDGES    = "TNA::THRUST_EDGES"
+        L_FORCE    = "TNA::FORCE_EDGES"
 
         if CLEAR_LAYER:
             dbg["cleared"] = {
@@ -214,12 +219,21 @@ def run():
                 "intrados": clear_objects_on_layer(L_INTRADOS),
                 "extrados": clear_objects_on_layer(L_EXTRADOS),
                 "edges": clear_objects_on_layer(L_EDGES),
+                "force": clear_objects_on_layer(L_FORCE),
             }
 
         # convert to Rhino meshes
         r_thrust   = compas_mesh_to_rhino_mesh(thrust)
         r_intrados = compas_mesh_to_rhino_mesh(intrados)
         r_extrados = compas_mesh_to_rhino_mesh(extrados)
+        r_force    = compas_mesh_to_rhino_mesh(force)
+        
+        dbg["rhino_meshes"] = {
+            "thrust": r_thrust.Vertices.Count,
+            "intrados": r_intrados.Vertices.Count,
+            "extrados": r_extrados.Vertices.Count,
+            "force": r_force.Vertices.Count,
+        }
 
         # bake
         baked = {}
@@ -233,6 +247,11 @@ def run():
                 "ids": bake_thrust_edges(thrust, L_EDGES, "thrust_edge"),
             }
 
+        if BAKE_FORCE:
+            baked["force"] = {
+                "layer": ensure_layer(L_FORCE),
+                "ids": bake_thrust_edges(force, L_FORCE, "force_edge"),
+            }
         sc.doc.Views.Redraw()
 
         return {"ok": True, "baked": baked, "dbg": dbg}
