@@ -344,6 +344,66 @@ def patch_force_ordered_edges(force):
     force.ordered_edges = types.MethodType(_ordered_edges, force)
 
 
+def _poly_area_xy(pts):
+    # pts: list of (x,y)
+    if len(pts) < 3:
+        return 0.0
+    a = 0.0
+    for i in range(len(pts)):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % len(pts)]
+        a += x1 * y2 - x2 * y1
+    return 0.5 * a
+
+def remove_outer_face_if_present(mesh_like):
+    """
+    Heuristic: remove the single largest-area face that is mostly boundary vertices.
+    This targets the unbounded/outside face that would otherwise get triangulated and 'cap' the vault.
+    """
+    bset = set(boundary_vertices(mesh_like))
+    if not bset:
+        return {"removed": False, "reason": "no boundary vertices"}
+
+    best_f = None
+    best_score = -1.0
+
+    for f in list(mesh_like.faces()):
+        vs = mesh_like.face_vertices(f)
+        if not vs or len(vs) < 3:
+            continue
+
+        # must be strongly "boundary-ish"
+        bcnt = sum(1 for v in vs if v in bset)
+        frac = float(bcnt) / float(len(vs))
+
+        # compute XY area magnitude
+        pts = [(mesh_like.vertex_attribute(v, "x"), mesh_like.vertex_attribute(v, "y")) for v in vs]
+        area = abs(_poly_area_xy(pts))
+
+        # score: prioritize (big area) * (boundary fraction)
+        score = area * frac
+
+        if score > best_score:
+            best_score = score
+            best_f = (f, area, frac, len(vs))
+
+    if best_f is None:
+        return {"removed": False, "reason": "no candidate faces"}
+
+    f, area, frac, nvs = best_f
+
+    # guardrails: only delete if it *really* looks like the outside face
+    # (large and mostly boundary vertices)
+    if frac < 0.60:
+        return {"removed": False, "reason": "best face not boundary-ish enough", "best": {"face": f, "area": area, "frac": frac, "n": nvs}}
+
+    try:
+        mesh_like.delete_face(f)
+        return {"removed": True, "face": f, "area": area, "frac": frac, "n": nvs}
+    except Exception as e:
+        return {"removed": False, "reason": "delete_face failed", "error": str(e), "best": {"face": f, "area": area, "frac": frac, "n": nvs}}
+
+
 # ==========================
 # ENTRYPOINT FOR RunnerV2
 # ==========================
@@ -414,7 +474,8 @@ def run():
             dbg["deleted_isolated_vertices"] = delete_isolated_vertices(form)
 
         dbg["form_VEF_after_clean"] = (form.number_of_vertices(), form.number_of_edges(), form.number_of_faces())
-
+        dbg["outer_face_removed"] = remove_outer_face_if_present(form)
+        
         # --- build thrust ---
         try:
             thrust = form.copy(cls=ThrustDiagram)
